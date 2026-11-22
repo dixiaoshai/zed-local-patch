@@ -6570,6 +6570,136 @@ async fn test_drag_multiple_entries(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_autoreveal_markdown_preview_source_without_stealing_focus(cx: &mut TestAppContext) {
+    use markdown_preview::markdown_preview_view::MarkdownPreviewView;
+
+    init_test_with_editor(cx);
+    cx.update(|cx| {
+        markdown_preview::init(cx);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project_panel
+                    .get_or_insert_default()
+                    .auto_reveal_entries = Some(true);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project_root"),
+        json!({
+            "docs": { "guide.md": "# Guide" },
+            "other.txt": "Other file",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/project_root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let source_path = project.read_with(cx, |project, cx| {
+        project
+            .find_project_path("project_root/docs/guide.md", cx)
+            .unwrap()
+    });
+    let source = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path(source_path, None, true, window, cx)
+        })
+        .await
+        .unwrap();
+    let editor = cx.update(|_, cx| source.act_as::<Editor>(cx).unwrap());
+    let preview = workspace.update_in(cx, |workspace, window, cx| {
+        let preview = MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx);
+        workspace.active_pane().update(cx, |pane, cx| {
+            pane.add_item(Box::new(preview.clone()), true, true, None, window, cx);
+        });
+        preview
+    });
+    cx.run_until_parked();
+
+    let other_path = project.read_with(cx, |project, cx| {
+        project
+            .find_project_path("project_root/other.txt", cx)
+            .unwrap()
+    });
+    let other = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path(other_path, None, true, window, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &[
+            "v project_root",
+            "    v docs",
+            "          guide.md",
+            "      other.txt  <== selected  <== marked",
+        ]
+    );
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        assert!(workspace.activate_item(&preview, true, true, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &[
+            "v project_root",
+            "    v docs",
+            "          guide.md  <== selected  <== marked",
+            "      other.txt",
+        ]
+    );
+    preview.update_in(cx, |preview, window, cx| {
+        assert!(preview.focus_handle(cx).contains_focused(window, cx));
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(!panel.focus_handle(cx).contains_focused(window, cx));
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        assert!(workspace.activate_item(other.as_ref(), true, true, window, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project_panel
+                    .get_or_insert_default()
+                    .auto_reveal_entries = Some(false);
+            });
+        });
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        assert!(workspace.activate_item(&preview, true, true, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &[
+            "v project_root",
+            "    v docs",
+            "          guide.md",
+            "      other.txt  <== selected  <== marked",
+        ]
+    );
+    preview.update_in(cx, |preview, window, cx| {
+        assert!(preview.focus_handle(cx).contains_focused(window, cx));
+    });
+}
+
+#[gpui::test]
 async fn test_autoreveal_and_gitignored_files(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
     cx.update(|cx| {

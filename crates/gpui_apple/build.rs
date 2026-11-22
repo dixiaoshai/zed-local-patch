@@ -183,6 +183,10 @@ mod apple_build {
                 "-MO",
                 "-c",
             ])
+            .arg(format!(
+                "-fmodules-cache-path={}",
+                out_dir.join("metal-module-cache").display()
+            ))
             .arg(&staged_shader_path)
             .args(["-include", header_path.to_str().unwrap(), "-o"])
             .arg(&air_output_path)

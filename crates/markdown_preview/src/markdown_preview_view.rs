@@ -1847,6 +1847,15 @@ impl Item for MarkdownPreviewView {
         }
     }
 
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let editor = self.active_editor.as_ref()?.editor.read(cx);
+        let path = editor.active_project_path(cx)?;
+        // Excluded files have no tree entry. Exposing their path here would let
+        // reopening the source reuse this preview as its editor.
+        editor.project()?.read(cx).entry_for_path(&path, cx)?;
+        Some(path)
+    }
+
     fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
         ItemBufferKind::Singleton
     }
@@ -2412,6 +2421,42 @@ mod tests {
         assert_eq!(
             filter_non_rendered_matches(vec![58..65, 1..9, 30..37], &non_rendered_ranges),
             vec![58..65, 1..9]
+        );
+    }
+
+    #[gpui::test]
+    async fn activating_markdown_preview_selects_its_project_entry(cx: &mut TestAppContext) {
+        let (project, workspace, multi_workspace) = markdown_workspace(
+            cx,
+            json!({
+                "docs": { "guide.md": "# Guide" },
+                "other.md": "# Other",
+            }),
+            false,
+        )
+        .await;
+        open_project_file(cx, &project, &multi_workspace, "docs/guide.md", None, true).await;
+        let source_entry = project.read_with(cx, |project, _| project.active_entry());
+        assert!(source_entry.is_some());
+        let preview = open_preview_for_active_editor(cx, &multi_workspace);
+        open_project_file(cx, &project, &multi_workspace, "other.md", None, true).await;
+        assert_ne!(
+            project.read_with(cx, |project, _| project.active_entry()),
+            source_entry
+        );
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(&preview, true, true, window, cx));
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            project.read_with(cx, |project, _| project.active_entry()),
+            source_entry
         );
     }
 
@@ -4031,6 +4076,9 @@ mod tests {
         let editor_b = cx.update(|cx| opened_item.act_as::<Editor>(cx).unwrap());
         let editor_b_path = editor_source_path(cx, &editor_b);
         assert_eq!(editor_b_path.as_ref(), rel_path("b.md"));
+        let project = editor_b.read_with(cx, |editor, _| editor.project().unwrap().clone());
+        let entry_b = project.read_with(cx, |project, _| project.active_entry());
+        assert!(entry_b.is_some());
 
         let (preview, workspace_id) = multi_workspace
             .update(cx, |multi_workspace, window, cx| {
@@ -4087,6 +4135,10 @@ mod tests {
 
         let followed_path = preview_source_path(cx, &preview);
         assert_eq!(followed_path.as_ref(), rel_path("b.md"));
+        assert_eq!(
+            project.read_with(cx, |project, _| project.active_entry()),
+            entry_b
+        );
 
         assert_eq!(
             saved_preview_path(cx, preview.entity_id().as_u64(), workspace_id),
