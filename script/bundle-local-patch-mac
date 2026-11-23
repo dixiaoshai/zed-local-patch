@@ -1,0 +1,66 @@
+#!/bin/bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+binary="$root/target/release/zedlocalpatch"
+output="${ZED_LOCAL_APP_OUTPUT:-$root/.local-build/Zed Local Patch Release.app}"
+explanation='Local build: apply patch and rebuild to update'
+
+if [[ ! -x "$binary" || ! -f "$binary" ]]; then
+  echo "Missing executable $binary; build the release binary first as described in README.md." >&2
+  exit 1
+fi
+if [[ -e "$output" || -L "$output" ]]; then
+  echo "Refusing to overwrite $output; choose a fresh output location or remove it manually." >&2
+  exit 1
+fi
+
+version="$(/usr/bin/python3 - "$binary" "$explanation" "$root/crates/zed/Cargo.toml" <<'PY'
+import mmap
+import re
+import sys
+
+with open(sys.argv[1], 'rb') as source:
+    with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as binary:
+        for text in (sys.argv[2], 'ZedLocalPatch'):
+            if binary.find(text.encode()) == -1:
+                raise SystemExit(f'Built binary lacks expected marker: {text!r}; rebuild with the documented environment.')
+
+with open(sys.argv[3], encoding='utf-8') as source:
+    manifest = source.read()
+package = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', manifest)
+version = re.search(r'^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', package.group(1), re.MULTILINE) if package else None
+if not version:
+    raise SystemExit('Could not read the package version from crates/zed/Cargo.toml.')
+print(version.group(1))
+PY
+)"
+
+mkdir -p "$(dirname "$output")"
+# Creating the bundle directory separately makes the no-overwrite check atomic.
+if ! mkdir "$output"; then
+  echo "Could not create fresh output directory $output; refusing to overwrite." >&2
+  exit 1
+fi
+mkdir -p "$output/Contents/MacOS" "$output/Contents/Resources"
+cp "$binary" "$output/Contents/MacOS/zedlocalpatch"
+cp "$root/crates/zed/resources/Document.icns" "$output/Contents/Resources/AppIcon.icns"
+/usr/bin/python3 - "$output/Contents/Info.plist" "$root/crates/zed/resources/info/Permissions.plist" "$version" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[2], 'rb') as source:
+    fragment = source.read()
+permissions = plistlib.loads(b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>' + fragment + b'</dict></plist>')
+plist = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='zedlocalpatch',
+    CFBundleIdentifier='dev.zed.ZedLocalPatch', CFBundleName='Zed Local Patch',
+    CFBundleDisplayName='Zed Local Patch', CFBundlePackageType='APPL',
+    CFBundleShortVersionString=sys.argv[3], CFBundleVersion=sys.argv[3],
+    CFBundleIconFile='AppIcon', LSMinimumSystemVersion='12.0', NSHighResolutionCapable=True)
+plist.update(permissions)
+with open(sys.argv[1], 'wb') as destination:
+    plistlib.dump(plist, destination)
+PY
+/usr/bin/codesign --force --deep --sign - "$output"
+/usr/bin/codesign --verify --deep --strict "$output"
+echo "Created $output (not installed or launched)."

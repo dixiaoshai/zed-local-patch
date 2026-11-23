@@ -1,0 +1,6 @@
+$ python3 probe_jdtls_call_hierarchy_progress.py    # 预热后稳态测量：确认“1 次 prepare = 1 个 progress end”
+IDLE 5s: progress ends = 0
+ROUND 1: result=None | response at 0.042s | progress ends total=1 after_response=0
+ROUND 2: result=None | response at 0.006s | progress ends total=1 after_response=0
+ROUND 3: result=None | response at 0.004s | progress ends total=1 after_response=0
+BURST 5 prepares: progress ends = 5

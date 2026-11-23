@@ -1,0 +1,33 @@
+$ python3 probe_jdtls_call_hierarchy_progress.py    # 单次 prepare 请求：观察 jdtls 主动发出的进度事件
+initialize -> ok
+
+--- server->client messages after ONE prepareCallHierarchy ---
+0.638s textDocument/publishDiagnostics
+0.688s window/workDoneProgress/create token=8fd7dffa-d39d-4aba-a683-27e9d6300638
+0.688s $/progress kind=begin title=Update classpath Job
+0.688s $/progress kind=report title=None
+0.689s $/progress kind=end title=None
+1.304s window/workDoneProgress/create token=e69c4053-0a29-481d-9b7b-cd54ce5eab49
+1.304s $/progress kind=begin title=Validate documents
+1.304s $/progress kind=report title=None
+1.306s $/progress kind=end title=None
+1.414s window/workDoneProgress/create token=f6d63399-8ec7-449e-834a-8e5effed0827
+1.414s $/progress kind=begin title=Background task
+1.415s $/progress kind=report title=None
+1.421s $/progress kind=end title=None
+1.554s window/workDoneProgress/create token=b2653e33-db63-44ab-bcf5-1f261e3e0023
+1.554s $/progress kind=begin title=Building
+1.555s $/progress kind=report title=None
+1.673s $/progress kind=end title=None
+1.680s textDocument/publishDiagnostics
+1.687s window/workDoneProgress/create token=3ef10ae0-7987-4361-8ff3-5fbf43797aec
+1.688s $/progress kind=begin title=Validate documents
+1.688s $/progress kind=report title=None
+1.689s $/progress kind=end title=None
+2.293s window/workDoneProgress/create token=c092d201-13ac-4560-ba53-aded21add641
+2.293s $/progress kind=begin title=Publish Diagnostics
+2.294s $/progress kind=report title=None
+2.497s textDocument/publishDiagnostics
+2.498s $/progress kind=end title=None
+
+progress 'end' notifications during 5 quick prepares: 11

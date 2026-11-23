@@ -18,6 +18,7 @@ fuzzy.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true
+lsp.workspace = true
 menu.workspace = true
 picker.workspace = true
 project.workspace = true

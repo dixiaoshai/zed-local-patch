@@ -221,14 +221,16 @@ impl ProgressToken {
         }
     }
 
-    fn from_proto(value: proto::ProgressToken) -> Option<Self> {
+    /// Recreate a progress token from its wire representation.
+    pub fn from_proto(value: proto::ProgressToken) -> Option<Self> {
         Some(match value.value? {
             proto::progress_token::Value::Number(number) => Self::Number(number),
             proto::progress_token::Value::String(string) => Self::String(SharedString::new(string)),
         })
     }
 
-    fn to_proto(&self) -> proto::ProgressToken {
+    /// Serialize this token for the wire.
+    pub fn to_proto(&self) -> proto::ProgressToken {
         proto::ProgressToken {
             value: Some(match self {
                 Self::Number(number) => proto::progress_token::Value::Number(*number),

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ops::Range,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
@@ -17,8 +18,9 @@ use gpui::{
 use language::{
     Buffer, CodeLabel, File as _, Language, Location, Rope, ToOffset, ToPoint, lsp_to_symbol_kind,
 };
+use lsp::LanguageServerId;
 use picker::{Picker, PickerDelegate};
-use project::{CallHierarchyItem, LspStoreEvent, Project};
+use project::{CallHierarchyItem, LspStoreEvent, ProgressToken, Project};
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -66,6 +68,10 @@ pub struct CallDisplay {
 }
 
 const BASE_MODAL_WIDTH: Rems = Rems(42.0);
+
+/// Upper bound on automatic refetches while the modal has no symbol, so a
+/// misbehaving language server can never keep the modal re-requesting forever.
+const MAX_FETCH_RETRIES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, settings::RegisterSetting)]
 pub struct CallHierarchySettings {
@@ -215,23 +221,65 @@ impl CallHierarchyView {
                 }
                 _ => {}
             });
-        let lsp_store_subscription = cx.subscribe_in(
-            &project.read(cx).lsp_store(),
-            window,
-            |view, _, event, window, cx| match event {
-                LspStoreEvent::LanguageServerUpdate {
-                    message: proto::update_language_server::Variant::WorkEnd(_),
+        let lsp_store = project.read(cx).lsp_store();
+        // Language server work that is already in flight when the modal opens must be
+        // able to trigger a retry once it finishes (e.g. indexing started before the
+        // modal was opened), so seed the tracked tokens from the LSP store's statuses.
+        let active_work_tokens: HashSet<(LanguageServerId, ProgressToken)> = lsp_store
+            .read(cx)
+            .language_server_statuses()
+            .flat_map(|(server_id, status)| {
+                status
+                    .pending_work
+                    .keys()
+                    .map(move |token| (server_id, token.clone()))
+            })
+            .collect();
+        let lsp_store_subscription =
+            cx.subscribe_in(&lsp_store, window, |view, _, event, window, cx| {
+                let LspStoreEvent::LanguageServerUpdate {
+                    language_server_id,
+                    message,
                     ..
-                } => {
-                    view.retry_empty_hierarchy(
-                        |delegate, _| delegate.queried_buffer.is_some(),
-                        window,
-                        cx,
-                    );
+                } = event
+                else {
+                    return;
+                };
+                match message {
+                    proto::update_language_server::Variant::WorkStart(payload) => {
+                        let Some(token) = payload.token.clone().and_then(ProgressToken::from_proto)
+                        else {
+                            return;
+                        };
+                        let key = (*language_server_id, token);
+                        view.picker.update(cx, |picker, _| {
+                            picker.delegate.active_work_tokens.insert(key);
+                        });
+                    }
+                    proto::update_language_server::Variant::WorkEnd(payload) => {
+                        let Some(token) = payload.token.clone().and_then(ProgressToken::from_proto)
+                        else {
+                            return;
+                        };
+                        let key = (*language_server_id, token);
+                        let should_retry = view.picker.update(cx, |picker, _| {
+                            picker.delegate.active_work_tokens.remove(&key);
+                            // Only work that predates the current prepare request may
+                            // trigger another request. Progress caused by the request
+                            // itself must not, or the modal would re-request forever.
+                            picker.delegate.retry_after_work_end.remove(&key)
+                        });
+                        if should_retry {
+                            view.retry_empty_hierarchy(
+                                |delegate, _| delegate.queried_buffer.is_some(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-        );
+            });
         let delegate = CallHierarchyDelegate::new(
             cx.entity().downgrade(),
             editor,
@@ -239,6 +287,7 @@ impl CallHierarchyView {
             workspace,
             mode,
             prev_scroll_position,
+            active_work_tokens,
             cx.focus_handle(),
         );
         let modal_width = CallHierarchySettings::get_global(cx)
@@ -277,9 +326,17 @@ impl CallHierarchyView {
         cx: &mut Context<Self>,
     ) {
         self.picker.update(cx, |picker, cx| {
-            if picker.delegate.root_item.is_none() && should_retry(&picker.delegate, cx) {
-                picker.delegate.fetch_root(window, cx);
+            if picker.delegate.root_item.is_some()
+                || picker.delegate.state == FetchState::Loading
+                || picker.delegate.retry_count >= MAX_FETCH_RETRIES
+            {
+                return;
             }
+            if !should_retry(&picker.delegate, cx) {
+                return;
+            }
+            picker.delegate.retry_count += 1;
+            picker.delegate.fetch_root(window, cx);
         });
     }
 
@@ -347,6 +404,13 @@ pub struct CallHierarchyDelegate {
     mode: CallHierarchyMode,
     state: FetchState,
     fetch_task: Option<Task<()>>,
+    /// Language server work currently in flight, tracked from work progress
+    /// notifications and seeded from the LSP store when the modal opens.
+    active_work_tokens: HashSet<(LanguageServerId, ProgressToken)>,
+    /// Work that was already in flight when the current prepare request was
+    /// issued. Only these tokens may trigger a retry when they finish.
+    retry_after_work_end: HashSet<(LanguageServerId, ProgressToken)>,
+    retry_count: usize,
     root_item: Option<CallHierarchyItem>,
     root_stack: Vec<CallHierarchyItem>,
     prev_scroll_position: Option<Point<ScrollOffset>>,
@@ -367,6 +431,7 @@ impl CallHierarchyDelegate {
         workspace: WeakEntity<Workspace>,
         mode: CallHierarchyMode,
         prev_scroll_position: Option<Point<ScrollOffset>>,
+        active_work_tokens: HashSet<(LanguageServerId, ProgressToken)>,
         focus_handle: FocusHandle,
     ) -> Self {
         Self {
@@ -377,6 +442,9 @@ impl CallHierarchyDelegate {
             mode,
             state: FetchState::Loading,
             fetch_task: None,
+            active_work_tokens,
+            retry_after_work_end: HashSet::new(),
+            retry_count: 0,
             root_item: None,
             root_stack: Vec::new(),
             prev_scroll_position,
@@ -400,11 +468,15 @@ impl CallHierarchyDelegate {
         });
         let Some((buffer, position)) = editor_anchor else {
             self.state = FetchState::NoSymbol;
+            self.retry_after_work_end.clear();
             cx.notify();
             return;
         };
         self.queried_buffer = Some(buffer.clone());
         self.state = FetchState::Loading;
+        // Snapshot the work that is already in flight before issuing the request.
+        // Progress caused by the request itself must not be able to re-trigger it.
+        self.retry_after_work_end = self.active_work_tokens.clone();
         cx.notify();
 
         let prepare_task = self.project.update(cx, |project, cx| {
@@ -441,6 +513,7 @@ impl CallHierarchyDelegate {
             picker
                 .update_in(cx, |picker, window, cx| {
                     picker.delegate.root_item = Some(root_item.clone());
+                    picker.delegate.retry_after_work_end.clear();
                     picker.refresh_placeholder(window, cx);
                 })
                 .ok();
@@ -1297,7 +1370,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use theme::SyntaxTheme;
     use util::{path, rel_path::rel_path};
@@ -2335,6 +2408,12 @@ mod tests {
             }
         });
 
+        // Language server work that is already running when the modal opens (e.g. the
+        // server is still indexing) should trigger a refresh once it finishes.
+        fake_server.start_progress("index-a").await;
+        fake_server.start_progress("index-b").await;
+        cx.executor().run_until_parked();
+
         cx.dispatch_action(ShowIncomingCalls);
         cx.executor().run_until_parked();
 
@@ -2343,24 +2422,32 @@ mod tests {
                 workspace.active_modal::<CallHierarchyView>(cx)
             })
             .expect("modal should be open");
-        let project = modal.read_with(cx, |view, cx| {
+        modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
             assert_eq!(delegate.state, FetchState::NoSymbol);
-            delegate.project.clone()
+            assert!(
+                !delegate.retry_after_work_end.is_empty(),
+                "work running at fetch time should be armed for a retry"
+            );
         });
 
-        emit_work_end(&project, cx);
+        fake_server.end_progress("index-a");
         cx.executor().run_until_parked();
         modal.read_with(cx, |view, cx| {
+            let delegate = &view.picker.read(cx).delegate;
             assert_eq!(
-                view.picker.read(cx).delegate.state,
+                delegate.state,
                 FetchState::NoSymbol,
                 "a retry against a still-empty server should stay empty"
+            );
+            assert_eq!(
+                delegate.retry_count, 1,
+                "finishing pre-existing work should retry the preparation once"
             );
         });
 
         server_ready.store(true, Ordering::Release);
-        emit_work_end(&project, cx);
+        fake_server.end_progress("index-b");
         cx.executor().run_until_parked();
         modal.read_with(cx, |view, cx| {
             let delegate = &view.picker.read(cx).delegate;
@@ -2370,6 +2457,52 @@ mod tests {
                 "finished language server work should retry the preparation"
             );
             assert_eq!(delegate.calls[0].item.name, "main");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_call_hierarchy_modal_ignores_progress_from_its_own_request(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (workspace, fake_server, _test_uri, cx) = setup_modal_test("fn main() {}\n", cx).await;
+
+        let prepare_requests = Arc::new(AtomicUsize::new(0));
+        fake_server.set_request_handler::<lsp::request::CallHierarchyPrepare, _, _>({
+            let prepare_requests = prepare_requests.clone();
+            move |_, _| {
+                let prepare_requests = prepare_requests.clone();
+                async move {
+                    prepare_requests.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(Vec::new()))
+                }
+            }
+        });
+
+        cx.dispatch_action(ShowIncomingCalls);
+        cx.executor().run_until_parked();
+        assert_eq!(prepare_requests.load(Ordering::SeqCst), 1);
+
+        // Language servers such as jdtls wrap `prepareCallHierarchy` in a client-visible
+        // progress group, so every request finishes one. That progress is started by the
+        // request itself and must not be able to re-trigger it, or the modal would keep
+        // requesting the language server forever (this used to loop at ~80 requests/s).
+        fake_server.start_progress("prepareCallHierarchy").await;
+        fake_server.end_progress("prepareCallHierarchy");
+        cx.executor().run_until_parked();
+
+        assert_eq!(
+            prepare_requests.load(Ordering::SeqCst),
+            1,
+            "progress created by the prepare request itself must not re-trigger it"
+        );
+        let modal = workspace
+            .update(cx, |workspace, cx| {
+                workspace.active_modal::<CallHierarchyView>(cx)
+            })
+            .expect("modal should stay open");
+        modal.read_with(cx, |view, cx| {
+            assert_eq!(view.picker.read(cx).delegate.state, FetchState::NoSymbol);
         });
     }
 

@@ -3,6 +3,21 @@
 
 # Zed
 
+## Zed Local Patch on macOS
+
+Build the app with the repository's Rust toolchain and the macOS toolchain on your `PATH`:
+
+```sh
+env -u ZED_RELEASE_CHANNEL \
+  ZED_UPDATE_EXPLANATION='Local build: apply patch and rebuild to update' \
+  cargo build --locked --release --target-dir target -p zed --bin zedlocalpatch &&
+  script/bundle-local-patch-mac
+```
+
+The script packages the optimized binary as `.local-build/Zed Local Patch Release.app` without installing it or overwriting an existing bundle. It uses separate default settings and data directories from official Zed. The build uses the dev release channel for isolation; the dev channel stores credentials in a local JSON file rather than Keychain by default. Leave `ZED_RELEASE_CHANNEL` unset when launching the app. Use the optimized bundle rather than a debug build when comparing scrolling performance with official Zed.
+
+Local fixes and their investigation notes live in [`local-notes/`](local-notes/). Most recently, the Call Hierarchy panel no longer re-requests the language server on progress notifications that its own request caused; see [local-notes/call-hierarchy-progress-loop.md](local-notes/call-hierarchy-progress-loop.md) for the root cause, the ~80 requests/second loop it used to trigger with jdtls, and the regression test that guards it.
+
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
